@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover" />
+    <title>AR por imagem enviada — cliente</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial;
+            background: #111;
+            color: #eee;
+        }
+
+        #ui {
+            position: fixed;
+            left: 10px;
+            top: 10px;
+            z-index: 20;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+        }
+
+        #videoCanvas,
+        #threeCanvas {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #videoCanvas {
+            z-index: 0;
+        }
+
+        #threeCanvas {
+            z-index: 5;
+            pointer-events: none;
+        }
+
+        #log {
+            max-height: 120px;
+            overflow: auto;
+            font-size: 12px;
+            margin-top: 6px;
+            color: #9f9;
+        }
+
+        button,
+        input {
+            font-size: 14px;
+            padding: 6px 8px;
+            margin: 4px 0;
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        label {
+            font-size: 13px;
+            opacity: 0.9;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="ui">
+        <label>1) Escolha a imagem que será o marcador (foto):</label>
+        <input id="fileInput" type="file" accept="image/*">
+        <button id="startBtn">2) Abrir câmera e iniciar AR</button>
+        <button id="stopBtn">Parar</button>
+        <div id="log"></div>
+    </div>
+
+    <!-- canvas para processamento com OpenCV -->
+    <canvas id="videoCanvas"></canvas>
+    <!-- Three.js irá recuperar o canvas do renderer -->
+    <div id="threeContainer"></div>
+
+    <!-- Three.js -->
+    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+    <!-- OpenCV.js (pode demorar para carregar) -->
+    <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+    <script>
+        (async () => {
+
+            const logEl = (s) => { const d = document.getElementById('log'); d.innerText = s + '\n' + d.innerText; };
+            logEl('Carregando... isso pode demorar um pouco na primeira vez (OpenCV.js).');
+
+            let markerImg = null;
+            let markerMat = null;
+            let markerKeypoints = null;
+            let markerDescriptors = null;
+
+            let capStream = null;
+            let videoEl = null;
+            let videoCanvas = document.getElementById('videoCanvas');
+            let vctx = videoCanvas.getContext('2d');
+
+            let running = false;
+
+            // Three.js setup
+            let scene, camera3, renderer, cube;
+            let threeCanvas;
+            function initThree(width, height) {
+                if (renderer) return;
+                renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+                renderer.setPixelRatio(window.devicePixelRatio || 1);
+                renderer.setSize(width, height);
+                renderer.domElement.style.position = 'fixed';
+                renderer.domElement.style.left = '0';
+                renderer.domElement.style.top = '0';
+                renderer.domElement.id = 'threeCanvas';
+                document.getElementById('threeContainer').appendChild(renderer.domElement);
+
+                scene = new THREE.Scene();
+                // camera3 acts as the "camera" for three scene. We'll update its projection matrix to match video.
+                camera3 = new THREE.PerspectiveCamera(60, width / height, 0.01, 1000);
+                camera3.position.set(0, 0, 0);
+
+                const light = new THREE.DirectionalLight(0xffffff, 1);
+                light.position.set(0, 1, 1).normalize();
+                scene.add(light);
+
+                // simple cube to represent 3D object
+                const geom = new THREE.BoxGeometry(1, 1, 1);
+                const mat = new THREE.MeshStandardMaterial({ metalness: 0.2, roughness: 0.6 });
+                cube = new THREE.Mesh(geom, mat);
+                cube.visible = false;
+                scene.add(cube);
+
+                // orient cube so it stands "upright" on marker plane
+                cube.position.set(0, 0.5, 0); // will adjust by pose
+                window.addEventListener('resize', () => {
+                    const w = window.innerWidth, h = window.innerHeight;
+                    renderer.setSize(w, h);
+                    camera3.aspect = w / h;
+                    camera3.updateProjectionMatrix();
+                });
+            }
+
+            // wait until OpenCV is ready
+            await new Promise((resolve) => {
+                const check = () => {
+                    if (typeof cv !== 'undefined' && cv && cv.Mat) {
+                        logEl('OpenCV.js carregado.');
+                        resolve();
+                    } else {
+                        setTimeout(check, 100);
+                    }
+                };
+                check();
+            });
+
+            // Helper: create cv.Mat from Image
+            function imageToMat(img) {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth || img.width;
+                canvas.height = img.naturalHeight || img.height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const mat = cv.matFromImageData(imgData);
+                return mat;
+            }
+
+            // compute ORB keypoints+descriptors for marker
+            function computeMarkerFeatures(img) {
+                if (!img) return;
+                const mat = imageToMat(img);
+                // convert to grayscale
+                let gray = new cv.Mat();
+                cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+                mat.delete();
+
+                const orb = new cv.ORB();
+                const keypoints = new cv.KeyPointVector();
+                const descriptors = new cv.Mat();
+                orb.detectAndCompute(gray, new cv.Mat(), keypoints, descriptors);
+                gray.delete();
+                orb.delete();
+
+                return { keypoints, descriptors };
+            }
+
+            // simple BF match + ratio test
+            function matchDescriptors(desc1, desc2) {
+                if (desc1.empty() || desc2.empty()) return [];
+                const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+                const matches = new cv.DMatchVectorVector();
+                bf.knnMatch(desc1, desc2, matches, 2);
+
+                const good = [];
+                for (let i = 0; i < matches.size(); i++) {
+                    const m = matches.get(i).get(0);
+                    const n = matches.get(i).get(1);
+                    if (m.distance < 0.75 * n.distance) {
+                        good.push(m);
+                    }
+                }
+                matches.delete();
+                bf.delete();
+                return good;
+            }
+
+            // convert KeyPointVector + matches -> array of point2f src and dst
+            function keypointsAndMatchesToPointArrays(kp1, kp2, matches) {
+                const srcPts = [];
+                const dstPts = [];
+                for (let i = 0; i < matches.length; i++) {
+                    const m = matches[i];
+                    const kpA = kp1.get(m.queryIdx);
+                    const kpB = kp2.get(m.trainIdx);
+                    srcPts.push(kpA.pt.x, kpA.pt.y);
+                    dstPts.push(kpB.pt.x, kpB.pt.y);
+                }
+                return { srcPts, dstPts };
+            }
+
+            // Rodrigues conversion: rvec (1x3) -> rotation matrix 3x3 (cv.Mat)
+            function rodriguesToMat(rvec) {
+                const R = new cv.Mat();
+                cv.Rodrigues(rvec, R);
+                return R;
+            }
+
+            // Convert cv.Rodrigues output to three.js Matrix4 suitable for setting object's world transform
+            function buildThreeMatrixFromRt(Rcv, tcv) {
+                // Rcv: cv.Mat 3x3, tcv: cv.Mat 3x1
+                // We'll build a THREE.Matrix4 that goes from marker coordinate frame to camera frame,
+                // then invert to set object relative to camera in three.js world coordinate.
+                // Note: coordinate system conversions might need tweaks per camera; this is a reasonable start.
+
+                // build 4x4 matrix
+                const r = [];
+                for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) r.push(Rcv.data64F ? Rcv.data64F[i * 3 + j] : Rcv.data[i * 3 + j]);
+
+                const t = [tcv.data64F ? tcv.data64F[0] : tcv.data[0],
+                tcv.data64F ? tcv.data64F[1] : tcv.data[1],
+                tcv.data64F ? tcv.data64F[2] : tcv.data[2]];
+
+                // OpenCV camera coords: x right, y down, z forward
+                // three.js camera coords: x right, y up, z backward
+                // Need to convert: flip Y and Z:
+                // We'll construct matrix that converts marker->camera (OpenCV) then adapt axes.
+                // Compose 4x4:
+                const m = new THREE.Matrix4();
+                const elements = [
+                    r[0], r[3], -r[6], 0,
+                    -r[1], -r[4], r[7], 0,
+                    r[2], r[5], -r[8], 0,
+                    t[0], -t[1], -t[2], 1
+                ];
+                // Three.Matrix4 expects column-major order in .elements; but setting from array requires transpose;
+                // we'll set elements manually to match.
+                m.set(
+                    elements[0], elements[4], elements[8], elements[12],
+                    elements[1], elements[5], elements[9], elements[13],
+                    elements[2], elements[6], elements[10], elements[14],
+                    elements[3], elements[7], elements[11], elements[15]
+                );
+
+                // The matrix we built maps marker points into THREE world (camera center at origin).
+                // We want the object's world matrix. Usually need to invert this to position the object relative to world-camera.
+                m.invert();
+                return m;
+            }
+
+            // Main loop: grab frame, detect, match, compute homography, pose, update three.js object
+            async function processLoop() {
+                if (!running) return;
+
+                if (!videoEl || videoEl.readyState < 2) {
+                    requestAnimationFrame(processLoop);
+                    return;
+                }
+
+                // draw video into canvas
+                const w = videoCanvas.width = videoEl.videoWidth;
+                const h = videoCanvas.height = videoEl.videoHeight;
+                vctx.drawImage(videoEl, 0, 0, w, h);
+
+                // prepare frame mat
+                const frame = cv.imread(videoCanvas);
+                const gray = new cv.Mat();
+                cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+                frame.delete();
+
+                // detect features in current frame
+                const orb = new cv.ORB();
+                const kpScene = new cv.KeyPointVector();
+                const descScene = new cv.Mat();
+                orb.detectAndCompute(gray, new cv.Mat(), kpScene, descScene);
+                orb.delete();
+
+                // match against marker descriptors
+                const good = matchDescriptors(markerDescriptors, descScene);
+
+                let found = false;
+                if (good.length >= 8) { // a threshold for findHomography
+                    // get matched points arrays
+                    const { srcPts, dstPts } = keypointsAndMatchesToPointArrays(markerKeypoints, kpScene, good);
+
+                    // convert to cv.Mat of size Nx1x2? Use Mat points of type CV_32F
+                    const srcMat = cv.matFromArray(good.length, 1, cv.CV_32FC2, srcPts);
+                    const dstMat = cv.matFromArray(good.length, 1, cv.CV_32FC2, dstPts);
+
+                    // find homography
+                    const mask = new cv.Mat();
+                    const H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 5, mask);
+
+                    if (!H.empty()) {
+                        // compute projected corners of marker into scene
+                        // marker corners in pixel coords:
+                        const mw = markerImg.naturalWidth || markerImg.width;
+                        const mh = markerImg.naturalHeight || markerImg.height;
+                        const corners = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, mw, 0, mw, mh, 0, mh]);
+                        const projCorners = new cv.Mat();
+                        cv.perspectiveTransform(corners, projCorners, H);
+
+                        // SolvePnP: we need object points in 3D for marker corners (define size) and their corresponding image points
+                        // define marker 3D coordinates in marker-local units (e.g., size 1)
+                        const markerSize = 1.0; // 1 unit
+                        const objPts = cv.matFromArray(4, 1, cv.CV_32FC3, [
+                            0, 0, 0,
+                            markerSize, 0, 0,
+                            markerSize, markerSize, 0,
+                            0, markerSize, 0
+                        ]);
+
+                        // image points from projCorners
+                        const imgPts = new cv.Mat();
+                        // convert projCorners to 4x1x2 (float)
+                        imgPts.create(4, 1, cv.CV_32FC2);
+                        for (let i = 0; i < 4; i++) {
+                            imgPts.data32F[i * 2 + 0] = projCorners.data32F[i * 2 + 0];
+                            imgPts.data32F[i * 2 + 1] = projCorners.data32F[i * 2 + 1];
+                        }
+
+                        // camera matrix approximation
+                        const fx = 1.2 * w; // heuristic focal length
+                        const fy = fx;
+                        const cx = w / 2;
+                        const cy = h / 2;
+                        const cameraMatrix = cv.matFromArray(3, 3, cv.CV_64FC1, [fx, 0, cx, 0, fy, cy, 0, 0, 1]);
+                        const distCoeffs = cv.Mat.zeros(4, 1, cv.CV_64FC1);
+
+                        const rvec = new cv.Mat();
+                        const tvec = new cv.Mat();
+                        const success = cv.solvePnP(objPts, imgPts, cameraMatrix, distCoeffs, rvec, tvec, false, cv.SOLVEPNP_ITERATIVE);
+
+                        if (success) {
+                            // convert rvec -> rotation matrix
+                            const R = new cv.Mat();
+                            cv.Rodrigues(rvec, R);
+
+                            // Build three.js matrix from R and t
+                            const threeM = buildThreeMatrixFromRt(R, tvec);
+
+                            // set cube visible and set its matrix
+                            cube.visible = true;
+                            // scale cube to marker size (approx)
+                            cube.scale.set(markerSize, markerSize, markerSize);
+                            cube.matrixAutoUpdate = false;
+                            cube.matrix.copy(threeM);
+
+                            found = true;
+
+                            R.delete();
+                        }
+
+                        // cleanup
+                        cameraMatrix.delete();
+                        distCoeffs.delete();
+                        rvec.delete();
+                        tvec.delete();
+                        objPts.delete();
+                        imgPts.delete();
+                        projCorners.delete();
+                        corners.delete();
+                    }
+
+                    H.delete();
+                    mask.delete();
+                    srcMat.delete();
+                    dstMat.delete();
+                }
+
+                // if not found, hide cube
+                if (!found) cube.visible = false;
+
+                // cleanup
+                kpScene.delete();
+                descScene.delete();
+                gray.delete();
+
+                // render three
+                renderer && renderer.render(scene, camera3);
+
+                requestAnimationFrame(processLoop);
+            }
+
+            // UI interactions
+            document.getElementById('fileInput').addEventListener('change', async (ev) => {
+                const f = ev.target.files[0];
+                if (!f) return;
+                const img = new Image();
+                img.onload = () => {
+                    markerImg = img;
+                    logEl('Imagem do marcador carregada: ' + f.name + ' (' + img.naturalWidth + 'x' + img.naturalHeight + ')');
+                    if (markerKeypoints) {
+                        // free previous
+                        markerKeypoints.delete();
+                        markerDescriptors.delete();
+                    }
+                    const feats = computeMarkerFeatures(img);
+                    markerKeypoints = feats.keypoints;
+                    markerDescriptors = feats.descriptors;
+                    logEl('Características do marcador extraídas: ' + markerKeypoints.size() + ' keypoints.');
+                };
+                img.onerror = () => logEl('Erro ao carregar a imagem.');
+                img.src = URL.createObjectURL(f);
+            });
+
+            document.getElementById('startBtn').addEventListener('click', async () => {
+                if (!markerImg) {
+                    alert('Escolha primeiro a imagem que será o marcador.');
+                    return;
+                }
+                if (running) return;
+                // open camera
+                try {
+                    capStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+                } catch (e) {
+                    alert('Erro ao abrir a câmera: ' + e);
+                    return;
+                }
+                videoEl = document.createElement('video');
+                videoEl.autoplay = true;
+                videoEl.playsInline = true;
+                videoEl.srcObject = capStream;
+                await videoEl.play();
+
+                // init three
+                initThree(window.innerWidth, window.innerHeight);
+                renderer.domElement.style.width = '100%';
+                renderer.domElement.style.height = '100%';
+
+                running = true;
+                logEl('Processamento iniciado. Aponte a câmera para o marcador (a foto que você enviou).');
+
+                // allow OpenCV to warm up & set canvas sizes
+                requestAnimationFrame(processLoop);
+            });
+
+            document.getElementById('stopBtn').addEventListener('click', () => {
+                running = false;
+                if (capStream) {
+                    capStream.getTracks().forEach(t => t.stop());
+                    capStream = null;
+                }
+                if (renderer) {
+                    renderer.domElement.remove();
+                    renderer = null;
+                    scene = null;
+                    camera3 = null;
+                }
+                logEl('Parado.');
+            });
+
+            logEl('Pronto. Escolha a imagem do marcador.');
+        })();
+    </script>
+</body>
+
+</html>
