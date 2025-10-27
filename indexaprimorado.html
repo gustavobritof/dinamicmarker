@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Museu Virtual WebXR</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            max-width: 300px;
+            z-index: 100;
+            pointer-events: none;
+        }
+
+        #vrButton {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            background: #1a73e8;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            z-index: 100;
+            display: none;
+            pointer-events: auto;
+        }
+
+        #vrButton:hover {
+            background: #1557b0;
+        }
+
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 12px;
+            pointer-events: none;
+        }
+
+        .hotspot {
+            position: absolute;
+            width: 40px;
+            height: 40px;
+            background: rgba(33, 150, 243, 0.8);
+            border: 3px solid white;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 20px;
+            font-weight: bold;
+            transition: all 0.3s;
+            pointer-events: auto;
+            z-index: 50;
+        }
+
+        .hotspot:hover {
+            transform: scale(1.2);
+            background: rgba(33, 150, 243, 1);
+        }
+
+        .info-panel {
+            position: absolute;
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            max-width: 300px;
+            pointer-events: auto;
+            z-index: 100;
+        }
+
+        .info-panel h3 {
+            margin: 0 0 10px 0;
+            color: #1976d2;
+        }
+
+        .info-panel p {
+            margin: 0;
+            color: #333;
+            line-height: 1.5;
+        }
+
+        .info-panel .close-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: #f44336;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 25px;
+            height: 25px;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+        }
+
+        .info-panel .close-btn:hover {
+            background: #d32f2f;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="info">
+        <h3>🏛️ Museu Virtual WebXR</h3>
+        <p>Carregando ambiente...</p>
+        <p style="font-size: 11px; margin-top: 10px;">Use WASD ou setas para mover, mouse para olhar</p>
+    </div>
+    <button id="vrButton">Entrar em RV</button>
+    <div id="controls">
+        <strong>Controles:</strong><br>
+        WASD / Setas: Mover<br>
+        Mouse: Olhar ao redor<br>
+        Shift: Correr<br>
+        Clique nos ícones 'i' para informações
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        let scene, camera, renderer, floor;
+        let moveForward = false, moveBackward = false;
+        let moveLeft = false, moveRight = false;
+        let prevTime = performance.now();
+        const velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+        let isRunning = false;
+        let interactiveObjects = [];
+        let isPointerLocked = false;
+
+        // Configuração inicial
+        function init() {
+            // Cena
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87ceeb);
+            scene.fog = new THREE.Fog(0x87ceeb, 10, 50);
+
+            // Câmera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 1.6, 5);
+
+            // Renderer com WebXR
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // Iluminação
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(5, 10, 5);
+            directionalLight.castShadow = true;
+            scene.add(directionalLight);
+
+            // Chão
+            const floorGeometry = new THREE.PlaneGeometry(50, 50);
+            const floorMaterial = new THREE.MeshStandardMaterial({
+                color: 0x808080,
+                roughness: 0.8,
+                metalness: 0.2
+            });
+            floor = new THREE.Mesh(floorGeometry, floorMaterial);
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            scene.add(floor);
+
+            // Criar ambiente do museu
+            createMuseum();
+
+            // Verificar suporte WebXR
+            checkXRSupport();
+
+            // Controles de teclado
+            document.addEventListener('keydown', onKeyDown);
+            document.addEventListener('keyup', onKeyUp);
+
+            // Pointer Lock
+            document.addEventListener('click', (event) => {
+                if (!event.target.classList.contains('hotspot') &&
+                    !event.target.classList.contains('close-btn') &&
+                    !event.target.closest('.info-panel') &&
+                    !event.target.closest('#vrButton')) {
+                    document.body.requestPointerLock();
+                }
+            });
+
+            document.addEventListener('pointerlockchange', () => {
+                isPointerLocked = document.pointerLockElement === document.body;
+            });
+
+            document.addEventListener('mousemove', onMouseMove);
+
+            // Redimensionamento
+            window.addEventListener('resize', onWindowResize);
+
+            // Info
+            document.getElementById('info').innerHTML = `
+                <h3>🏛️ Museu Virtual WebXR</h3>
+                <p>Ambiente carregado! Clique na tela para começar a explorar.</p>
+                <p style="font-size: 11px; margin-top: 10px;">Clique nos ícones 'i' azuis para ver informações</p>
+            `;
+
+            // Iniciar animação
+            renderer.setAnimationLoop(animate);
+        }
+
+        function createMuseum() {
+            // Paredes
+            const wallMaterial = new THREE.MeshStandardMaterial({ color: 0xf5f5dc });
+
+            // Parede traseira
+            const backWall = new THREE.Mesh(
+                new THREE.BoxGeometry(20, 5, 0.2),
+                wallMaterial
+            );
+            backWall.position.set(0, 2.5, -10);
+            scene.add(backWall);
+
+            // Paredes laterais
+            const sideWall1 = new THREE.Mesh(
+                new THREE.BoxGeometry(0.2, 5, 20),
+                wallMaterial
+            );
+            sideWall1.position.set(-10, 2.5, 0);
+            scene.add(sideWall1);
+
+            const sideWall2 = new THREE.Mesh(
+                new THREE.BoxGeometry(0.2, 5, 20),
+                wallMaterial
+            );
+            sideWall2.position.set(10, 2.5, 0);
+            scene.add(sideWall2);
+
+            // Pedestais com objetos
+            createPedestal(-5, 0, -5, 0xff6b6b, "Escultura Vermelha", "Uma peça contemporânea representando a paixão e energia. Criada em 2024 por artista local.");
+            createPedestal(0, 0, -5, 0x4ecdc4, "Arte Turquesa", "Símbolo de tranquilidade e equilíbrio. Esta obra explora formas geométricas complexas.");
+            createPedestal(5, 0, -5, 0xffe66d, "Ouro Solar", "Inspirada nos raios do sol, esta escultura captura luz e movimento em harmonia perfeita.");
+            createPedestal(-5, 0, 0, 0x95e1d3, "Serenidade Verde", "Representa a natureza e crescimento. Observe os detalhes entrelaçados.");
+            createPedestal(5, 0, 0, 0xf38181, "Rosa Eterno", "Uma homenagem ao amor e delicadeza. Técnica mista com elementos metálicos.");
+
+            // Quadros nas paredes
+            createPainting(-8, 2, -9.8, 0xff6b6b);
+            createPainting(-4, 2, -9.8, 0x4ecdc4);
+            createPainting(0, 2, -9.8, 0xffe66d);
+            createPainting(4, 2, -9.8, 0x95e1d3);
+            createPainting(8, 2, -9.8, 0xf38181);
+        }
+
+        function createPedestal(x, y, z, color, title, description) {
+            // Base do pedestal
+            const pedestalGeometry = new THREE.CylinderGeometry(0.5, 0.6, 1, 8);
+            const pedestalMaterial = new THREE.MeshStandardMaterial({
+                color: 0xcccccc,
+                roughness: 0.7
+            });
+            const pedestal = new THREE.Mesh(pedestalGeometry, pedestalMaterial);
+            pedestal.position.set(x, y + 0.5, z);
+            scene.add(pedestal);
+
+            // Objeto exposto
+            const objectGeometry = new THREE.TorusKnotGeometry(0.3, 0.1, 64, 8);
+            const objectMaterial = new THREE.MeshStandardMaterial({
+                color: color,
+                roughness: 0.3,
+                metalness: 0.7
+            });
+            const object = new THREE.Mesh(objectGeometry, objectMaterial);
+            object.position.set(x, y + 1.5, z);
+            object.userData = {
+                rotate: true,
+                interactive: true,
+                title: title,
+                description: description
+            };
+            scene.add(object);
+            interactiveObjects.push(object);
+        }
+
+        function createPainting(x, y, z, color) {
+            // Moldura
+            const frameGeometry = new THREE.BoxGeometry(1.5, 2, 0.1);
+            const frameMaterial = new THREE.MeshStandardMaterial({ color: 0x8b4513 });
+            const frame = new THREE.Mesh(frameGeometry, frameMaterial);
+            frame.position.set(x, y, z);
+            scene.add(frame);
+
+            // "Pintura"
+            const paintingGeometry = new THREE.PlaneGeometry(1.3, 1.8);
+            const paintingMaterial = new THREE.MeshStandardMaterial({ color: color });
+            const painting = new THREE.Mesh(paintingGeometry, paintingMaterial);
+            painting.position.set(x, y, z + 0.06);
+            scene.add(painting);
+        }
+
+        function checkXRSupport() {
+            if ('xr' in navigator) {
+                navigator.xr.isSessionSupported('immersive-vr').then((supported) => {
+                    if (supported) {
+                        const vrButton = document.getElementById('vrButton');
+                        vrButton.style.display = 'block';
+                        vrButton.addEventListener('click', onVRButtonClick);
+                    }
+                });
+            }
+        }
+
+        function onVRButtonClick() {
+            if (!renderer.xr.isPresenting) {
+                navigator.xr.requestSession('immersive-vr', {
+                    optionalFeatures: ['local-floor', 'bounded-floor']
+                }).then(onSessionStarted);
+            }
+        }
+
+        function onSessionStarted(session) {
+            session.addEventListener('end', onSessionEnded);
+            renderer.xr.setSession(session);
+            document.getElementById('vrButton').textContent = 'Sair da RV';
+        }
+
+        function onSessionEnded() {
+            document.getElementById('vrButton').textContent = 'Entrar em RV';
+        }
+
+        function onKeyDown(event) {
+            switch (event.code) {
+                case 'ArrowUp':
+                case 'KeyW':
+                    moveForward = true;
+                    break;
+                case 'ArrowLeft':
+                case 'KeyA':
+                    moveLeft = true;
+                    break;
+                case 'ArrowDown':
+                case 'KeyS':
+                    moveBackward = true;
+                    break;
+                case 'ArrowRight':
+                case 'KeyD':
+                    moveRight = true;
+                    break;
+                case 'ShiftLeft':
+                case 'ShiftRight':
+                    isRunning = true;
+                    break;
+            }
+        }
+
+        function onKeyUp(event) {
+            switch (event.code) {
+                case 'ArrowUp':
+                case 'KeyW':
+                    moveForward = false;
+                    break;
+                case 'ArrowLeft':
+                case 'KeyA':
+                    moveLeft = false;
+                    break;
+                case 'ArrowDown':
+                case 'KeyS':
+                    moveBackward = false;
+                    break;
+                case 'ArrowRight':
+                case 'KeyD':
+                    moveRight = false;
+                    break;
+                case 'ShiftLeft':
+                case 'ShiftRight':
+                    isRunning = false;
+                    break;
+            }
+        }
+
+        function onMouseMove(event) {
+            if (isPointerLocked) {
+                camera.rotation.y -= event.movementX * 0.002;
+                camera.rotation.x -= event.movementY * 0.002;
+                camera.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camera.rotation.x));
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            const time = performance.now();
+            const delta = (time - prevTime) / 1000;
+
+            // Movimento
+            velocity.x -= velocity.x * 10.0 * delta;
+            velocity.z -= velocity.z * 10.0 * delta;
+
+            direction.z = Number(moveForward) - Number(moveBackward);
+            direction.x = Number(moveRight) - Number(moveLeft);
+            direction.normalize();
+
+            const speed = isRunning ? 50.0 : 25.0;
+
+            if (moveForward || moveBackward) velocity.z -= direction.z * speed * delta;
+            if (moveLeft || moveRight) velocity.x -= direction.x * speed * delta;
+
+            // Aplicar movimento
+            const moveVector = new THREE.Vector3();
+            moveVector.setFromMatrixColumn(camera.matrix, 0);
+            moveVector.crossVectors(camera.up, moveVector);
+            camera.position.addScaledVector(moveVector, velocity.z * delta);
+
+            moveVector.setFromMatrixColumn(camera.matrix, 0);
+            camera.position.addScaledVector(moveVector, velocity.x * delta);
+
+            // Animar objetos
+            scene.traverse((child) => {
+                if (child.userData.rotate) {
+                    child.rotation.y += delta;
+                }
+            });
+
+            prevTime = time;
+
+            renderer.render(scene, camera);
+
+            // Atualizar posição dos hotspots
+            updateHotspots();
+        }
+
+        function updateHotspots() {
+            interactiveObjects.forEach(obj => {
+                const vector = obj.position.clone();
+                vector.project(camera);
+
+                const x = (vector.x * 0.5 + 0.5) * window.innerWidth;
+                const y = (vector.y * -0.5 + 0.5) * window.innerHeight;
+
+                let hotspot = document.querySelector(`[data-object="${obj.uuid}"]`);
+
+                // Verificar se está na frente da câmera e visível
+                if (vector.z < 1 && x > 0 && x < window.innerWidth && y > 0 && y < window.innerHeight) {
+                    if (!hotspot) {
+                        hotspot = document.createElement('div');
+                        hotspot.className = 'hotspot';
+                        hotspot.innerHTML = 'i';
+                        hotspot.dataset.object = obj.uuid;
+                        hotspot.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            showInfoPanel(obj);
+                        });
+                        document.body.appendChild(hotspot);
+                    }
+
+                    hotspot.style.left = `${x - 20}px`;
+                    hotspot.style.top = `${y - 20}px`;
+                    hotspot.style.display = 'flex';
+                } else if (hotspot) {
+                    hotspot.style.display = 'none';
+                }
+            });
+        }
+
+        function showInfoPanel(object) {
+            // Remover painéis existentes
+            document.querySelectorAll('.info-panel').forEach(p => p.remove());
+
+            const panel = document.createElement('div');
+            panel.className = 'info-panel';
+
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'close-btn';
+            closeBtn.innerHTML = '×';
+            closeBtn.onclick = function () {
+                panel.remove();
+            };
+
+            const title = document.createElement('h3');
+            title.textContent = object.userData.title;
+
+            const description = document.createElement('p');
+            description.textContent = object.userData.description;
+
+            panel.appendChild(closeBtn);
+            panel.appendChild(title);
+            panel.appendChild(description);
+
+            const vector = object.position.clone();
+            vector.project(camera);
+
+            const x = (vector.x * 0.5 + 0.5) * window.innerWidth;
+            const y = (vector.y * -0.5 + 0.5) * window.innerHeight;
+
+            panel.style.left = `${Math.min(Math.max(x + 30, 10), window.innerWidth - 320)}px`;
+            panel.style.top = `${Math.max(y - 50, 10)}px`;
+
+            document.body.appendChild(panel);
+        }
+
+        init();
+    </script>
+</body>
+
+</html>
